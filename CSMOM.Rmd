@@ -1,0 +1,1695 @@
+---
+title: "CSMOM"
+author: "Jeronimo Munoz"
+date: "2025-07-30"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 
+
+# Cross-Sectional Momentum (CSMOM)
+
+```{r}
+# Load the Libraries
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(broom)
+
+library(caret)
+library(randomForest)
+library(xgboost)
+library(zoo)
+library(pROC)
+```
+
+## Country 1: Brazil 🇧🇷
+
+### Step 1 – Load and Prepare Brazil Data
+
+```{r}
+# importing historical price data for Brazilian stocks 
+
+brazil <- read_excel("Brazil_IBOV_ Data.xlsx", na = c("N/A", "#N/A"))
+
+```
+
+### Step 2 – Format Dates and Columns
+
+```{r}
+brazil <- brazil %>%                  
+  rename(Date = 1) %>%                # Rename first column to 'Date'
+  mutate(Date = as.Date(Date)) %>%    # Convert to Date format
+  arrange(Date)                       # Sort data chronologically
+```
+
+### Step 3 – Convert Price Columns to Numeric
+
+```{r}
+# Convert all price columns to numeric (excluding Date)
+brazil_prices <- brazil %>%
+  mutate(across(-Date, ~ as.numeric(.)))
+```
+
+## Step 4 – Calculate Momentum (t-2 / t-12 - 1)
+
+```{r}
+
+# Calculate momentum: (Price at t-2 / Price at t-12) - 1
+momentum_brazil <- brazil_prices %>%
+  select(-Date) %>%                                          # Exclude Date column
+  mutate(across(everything(), ~ lag(., 2) / lag(., 12) - 1)) # Momentum formula
+
+# Reattach the Date column
+momentum_brazil <- bind_cols(Date = brazil$Date, momentum_brazil)
+```
+
+### Step 5 – Rank into Deciles
+
+```{r}
+# Reshape to long format and assign momentum deciles per date
+momentum_deciles_brazil <- momentum_brazil %>%
+  pivot_longer(-Date, names_to = "Stock", values_to = "Momentum") %>%
+  group_by(Date) %>%
+  mutate(
+    Decile = ntile(Momentum, 10)  # Rank into 10 groups
+  ) %>%
+  ungroup()
+```
+
+### Step 6 – Calculate 1-Month Forward Returns
+
+```{r}
+# 1. Remove Date column and calculate 1-month forward returns
+returns_forward_brazil <- brazil %>%
+  select(-Date) %>%
+  mutate(across(everything(), ~ as.numeric(.))) %>%
+  mutate(across(everything(), ~ lead(.) / . - 1))
+
+# 2. Add back the Date column
+returns_forward_brazil <- bind_cols(Date = brazil$Date, returns_forward_brazil)
+```
+
+### Step 7 – Merge Momentum & Returns
+
+```{r}
+# Reshape forward returns to long format (one row per stock-date)
+returns_long_brazil <- returns_forward_brazil %>%
+  pivot_longer(-Date, names_to = "Stock", values_to = "ForwardReturn")
+
+# Merge forward returns with momentum decile information
+final_data_brazil <- momentum_deciles_brazil %>%
+  left_join(returns_long_brazil, by = c("Date", "Stock"))
+```
+
+### Step 8 – Summary Statistics and Visualisation
+
+```{r}
+# Calculate average 1-month forward return per momentum decile (across all dates)
+decile_summary_brazil <- final_data_brazil %>%
+  group_by(Decile) %>%
+  summarise(
+    AvgForwardReturn = mean(ForwardReturn, na.rm = TRUE), # Mean return by decile
+    Count = n()                                           # Number of observations 
+  )
+```
+
+```{r}
+# Bar chart of average forward return by momentum decile
+ggplot(decile_summary_brazil, aes(x = Decile, y = AvgForwardReturn)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average 1-Month Forward Return by Momentum Decile",
+       x = "Momentum Decile",
+       y = "Avg Forward Return") +
+  theme_minimal()
+```
+
+### Step 9 – Identify Top and Bottom Decile Stocks (Latest Date)
+
+```{r}
+# Get the latest date available in the data
+latest_date_brazil <- max(momentum_deciles_brazil$Date, na.rm = TRUE)
+
+# Extract top decile (highest momentum) stocks for that date
+top_decile_stocks_brazil <- momentum_deciles_brazil %>%
+  filter(Date == latest_date_brazil, Decile == 10) %>%
+  select(Stock, Momentum)
+
+# Extract bottom decile (lowest momentum) stocks for that date
+bottom_decile_stocks_brazil <- momentum_deciles_brazil %>%
+  filter(Date == latest_date_brazil, Decile == 1) %>%
+  select(Stock, Momentum)
+
+# Print the stocks in each group
+cat("Top Decile (Winners) on", latest_date_brazil, ":\n")
+print(top_decile_stocks_brazil)
+
+cat("\nBottom Decile (Losers) on", latest_date_brazil, ":\n")
+print(bottom_decile_stocks_brazil)
+
+```
+
+### Step 10 – Long–Short Strategy
+
+```{r}
+# Calculate long–short strategy returns: Decile 10 (long) minus Decile 1 (short)
+long_short_spread_brazil <- final_data_brazil %>%
+  filter(Decile %in% c(1, 10)) %>%    # Keep only top and bottom deciles
+  group_by(Date, Decile) %>%
+  summarise(Return = mean(ForwardReturn, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Decile, values_from = Return, names_prefix = "Decile") %>%
+  mutate(LongShort = Decile10 - Decile1) %>%   # Strategy return
+  arrange(Date)
+```
+
+```{r}
+# Plot cumulative return of long–short strategy over time
+long_short_spread_brazil <- long_short_spread_brazil %>%
+  mutate(CumulativeReturn = cumsum(replace_na(LongShort, 0)))  # Replace NAs with 0 to avoid breaks
+
+
+ggplot(long_short_spread_brazil, aes(x = Date, y = CumulativeReturn)) +
+  geom_line(color = "darkblue", size = 1.2) +
+  labs(
+    title = "Cumulative Return of Long–Short Momentum Strategy",
+    x = "Date",
+    y = "Cumulative Return"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Summary statistics for the long–short momentum strategy
+
+# Remove NA values for performance metrics
+spread_returns_brazil <- na.omit(long_short_spread_brazil$LongShort)
+
+# Compute mean return, volatility, and Sharpe ratio
+mean_return_brazil <- mean(spread_returns_brazil)
+volatility_brazil <- sd(spread_returns_brazil)
+sharpe_ratio_brazil <- mean_return_brazil / volatility_brazil
+
+# Display metrics in a nicely formatted table
+data.frame(
+  Mean = mean_return_brazil,
+  Volatility = volatility_brazil,
+  Sharpe_Ratio = sharpe_ratio_brazil
+) %>%
+  knitr::kable(digits = 4, caption = "Performance Metrics for Long–Short Momentum Strategy")
+```
+
+### Step 11 – Regression Analysis
+
+```{r}
+# Clean data to avoid NA issues
+regression_data_brazil <- final_data_brazil %>%
+  filter(!is.na(ForwardReturn), !is.na(Decile))
+
+# Regress forward returns on deciles
+model_brazil <- lm(ForwardReturn ~ Decile, data = regression_data_brazil)
+
+# View regression output
+summary(model_brazil)
+```
+
+|     |     |     |     |     |
+|-----|-----|-----|-----|-----|
+|     |     |     |     |     |
+|     |     |     |     |     |
+
+## Country 2: Mexico 🇲🇽
+
+### Step 1 – Load and Prepare Mexico Data
+
+```{r}
+# begin by importing historical price data for Mexican stocks 
+
+mexico <- read_excel("Mexico_MEXBOL_Data.xlsx", na = c("N/A", "#N/A")) 
+```
+
+### Step 2 – Format Dates and Columns
+
+```{r}
+mexico <- mexico %>%                  
+  rename(Date = 1) %>%                # Rename first column to 'Date'
+  mutate(Date = as.Date(Date)) %>%    # Convert to Date format
+  arrange(Date)                       # Sort data chronologically
+```
+
+### Step 3 – Convert Price Columns to Numeric
+
+```{r}
+# Convert all price columns to numeric (excluding Date)
+mexico_prices <- mexico %>%
+  mutate(across(-Date, ~ as.numeric(.)))
+```
+
+## Step 4 – Calculate Momentum (t-2 / t-12 - 1)
+
+```{r}
+
+# Calculate momentum: (Price at t-2 / Price at t-12) - 1
+momentum_mexico <- mexico_prices %>%
+  select(-Date) %>%                                          # Exclude Date column
+  mutate(across(everything(), ~ lag(., 2) / lag(., 12) - 1)) # Momentum formula
+
+# Reattach the Date column
+momentum_mexico <- bind_cols(Date = mexico$Date, momentum_mexico)
+```
+
+### Step 5 – Rank into Deciles
+
+```{r}
+# Reshape to long format and assign momentum deciles per date
+momentum_deciles_mexico <- momentum_mexico %>%
+  pivot_longer(-Date, names_to = "Stock", values_to = "Momentum") %>%
+  group_by(Date) %>%
+  mutate(
+    Decile = ntile(Momentum, 10)  # Rank into 10 groups
+  ) %>%
+  ungroup()
+```
+
+### Step 6 – Calculate 1-Month Forward Returns
+
+```{r}
+# 1. Remove Date column and calculate 1-month forward returns
+returns_forward_mexico <- mexico %>%
+  select(-Date) %>%
+  mutate(across(everything(), ~ as.numeric(.))) %>%
+  mutate(across(everything(), ~ lead(.) / . - 1))
+
+# 2. Add back the Date column
+returns_forward_mexico <- bind_cols(Date = mexico$Date, returns_forward_mexico)
+```
+
+### Step 7 – Merge Momentum & Returns
+
+```{r}
+# Reshape forward returns to long format (one row per stock-date)
+returns_long_mexico <- returns_forward_mexico %>%
+  pivot_longer(-Date, names_to = "Stock", values_to = "ForwardReturn")
+
+# Merge forward returns with momentum decile information
+final_data_mexico <- momentum_deciles_mexico %>%
+  left_join(returns_long_mexico, by = c("Date", "Stock"))
+```
+
+### Step 8 – Summary Statistics and Visualisation
+
+```{r}
+# Calculate average 1-month forward return per momentum decile (across all dates)
+decile_summary_mexico <- final_data_mexico %>%
+  group_by(Decile) %>%
+  summarise(
+    AvgForwardReturn = mean(ForwardReturn, na.rm = TRUE), # Mean return by decile
+    Count = n()                                           # Number of observations 
+  )
+```
+
+```{r}
+# Bar chart of average forward return by momentum decile
+ggplot(decile_summary_mexico, aes(x = Decile, y = AvgForwardReturn)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average 1-Month Forward Return by Momentum Decile",
+       x = "Momentum Decile",
+       y = "Avg Forward Return") +
+  theme_minimal()
+```
+
+### Step 9 – Identify Top and Bottom Decile Stocks (Latest Date)
+
+```{r}
+# Get the latest date available in the data
+latest_date_mexico <- max(momentum_deciles_mexico$Date, na.rm = TRUE)
+
+# Extract top decile (highest momentum) stocks for that date
+top_decile_stocks_mexico <- momentum_deciles_mexico %>%
+  filter(Date == latest_date_mexico, Decile == 10) %>%
+  select(Stock, Momentum)
+
+# Extract bottom decile (lowest momentum) stocks for that date
+bottom_decile_stocks_mexico <- momentum_deciles_mexico %>%
+  filter(Date == latest_date_mexico, Decile == 1) %>%
+  select(Stock, Momentum)
+
+# Print the stocks in each group
+cat("Top Decile (Winners) on", latest_date_mexico, ":\n")
+print(top_decile_stocks_mexico)
+
+cat("\nBottom Decile (Losers) on", latest_date_mexico, ":\n")
+print(bottom_decile_stocks_mexico)
+
+```
+
+### Step 10 – Long–Short Strategy
+
+```{r}
+# Calculate long–short strategy returns: Decile 10 (long) minus Decile 1 (short)
+long_short_spread_mexico <- final_data_mexico %>%
+  filter(Decile %in% c(1, 10)) %>%    # Keep only top and bottom deciles
+  group_by(Date, Decile) %>%
+  summarise(Return = mean(ForwardReturn, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Decile, values_from = Return, names_prefix = "Decile") %>%
+  mutate(LongShort = Decile10 - Decile1) %>%   # Strategy return
+  arrange(Date)
+```
+
+```{r}
+# Plot cumulative return of long–short strategy over time
+long_short_spread_mexico <- long_short_spread_mexico %>%
+  mutate(CumulativeReturn = cumsum(replace_na(LongShort, 0)))  # Replace NAs with 0 to avoid breaks
+
+
+ggplot(long_short_spread_mexico, aes(x = Date, y = CumulativeReturn)) +
+  geom_line(color = "darkblue", size = 1.2) +
+  labs(
+    title = "Cumulative Return of Long–Short Momentum Strategy",
+    x = "Date",
+    y = "Cumulative Return"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Summary statistics for the long–short momentum strategy
+
+# Remove NA values for performance metrics
+spread_returns_mexico <- na.omit(long_short_spread_mexico$LongShort)
+
+# Compute mean return, volatility, and Sharpe ratio
+mean_return_mexico <- mean(spread_returns_mexico)
+volatility_mexico <- sd(spread_returns_mexico)
+sharpe_ratio_mexico <- mean_return_mexico / volatility_mexico
+
+# Display metrics in a nicely formatted table
+data.frame(
+  Mean = mean_return_mexico,
+  Volatility = volatility_mexico,
+  Sharpe_Ratio = sharpe_ratio_mexico
+) %>%
+  knitr::kable(digits = 4, caption = "Performance Metrics for Long–Short Momentum Strategy")
+```
+
+### Step 11 – Regression Analysis
+
+```{r}
+# Clean data to avoid NA issues
+regression_data_mexico <- final_data_mexico %>%
+  filter(!is.na(ForwardReturn), !is.na(Decile))
+
+# Regress forward returns on deciles
+model_mexico <- lm(ForwardReturn ~ Decile, data = regression_data_mexico)
+
+# View regression output
+summary(model_mexico)
+```
+
+## Country 3: India
+
+### Step 1 – Load and Prepare India Data
+
+```{r}
+# begin by importing historical price data for Indian stocks 
+
+india <- read_excel("India_Nifty_Data.xlsx", na = "N/A")
+```
+
+### Step 2 – Format Dates and Columns
+
+```{r}
+india <- india %>%                  
+  rename(Date = 1) %>%                # Rename first column to 'Date'
+  mutate(Date = as.Date(Date)) %>%    # Convert to Date format
+  arrange(Date)                       # Sort data chronologically
+```
+
+### Step 3 – Convert Price Columns to Numeric
+
+```{r}
+# Convert all price columns to numeric (excluding Date)
+india_prices <- india %>%
+  mutate(across(-Date, ~ as.numeric(.)))
+```
+
+## Step 4 – Calculate Momentum (t-2 / t-12 - 1)
+
+```{r}
+
+# Calculate momentum: (Price at t-2 / Price at t-12) - 1
+momentum_india <- india_prices %>%
+  select(-Date) %>%                                          # Exclude Date column
+  mutate(across(everything(), ~ lag(., 2) / lag(., 12) - 1)) # Momentum formula
+
+# Reattach the Date column
+momentum_india <- bind_cols(Date = india$Date, momentum_india)
+```
+
+### Step 5 – Rank into Deciles
+
+```{r}
+# Reshape to long format and assign momentum deciles per date
+momentum_deciles_india <- momentum_india %>%
+  pivot_longer(-Date, names_to = "Stock", values_to = "Momentum") %>%
+  group_by(Date) %>%
+  mutate(
+    Decile = ntile(Momentum, 10)  # Rank into 10 groups
+  ) %>%
+  ungroup()
+```
+
+### Step 6 – Calculate 1-Month Forward Returns
+
+```{r}
+# 1. Remove Date column and calculate 1-month forward returns
+returns_forward_india <- india %>%
+  select(-Date) %>%
+  mutate(across(everything(), ~ as.numeric(.))) %>%
+  mutate(across(everything(), ~ lead(.) / . - 1))
+
+# 2. Add back the Date column
+returns_forward_india <- bind_cols(Date = india$Date, returns_forward_india)
+```
+
+### Step 7 – Merge Momentum & Returns
+
+```{r}
+# Reshape forward returns to long format (one row per stock-date)
+returns_long_india <- returns_forward_india %>%
+  pivot_longer(-Date, names_to = "Stock", values_to = "ForwardReturn")
+
+# Merge forward returns with momentum decile information
+final_data_india <- momentum_deciles_india %>%
+  left_join(returns_long_india, by = c("Date", "Stock"))
+```
+
+### Step 8 – Summary Statistics and Visualisation
+
+```{r}
+# Calculate average 1-month forward return per momentum decile (across all dates)
+decile_summary_india <- final_data_india %>%
+  group_by(Decile) %>%
+  summarise(
+    AvgForwardReturn = mean(ForwardReturn, na.rm = TRUE), # Mean return by decile
+    Count = n()                                           # Number of observations 
+  )
+```
+
+```{r}
+# Bar chart of average forward return by momentum decile
+ggplot(decile_summary_india, aes(x = Decile, y = AvgForwardReturn)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average 1-Month Forward Return by Momentum Decile",
+       x = "Momentum Decile",
+       y = "Avg Forward Return") +
+  theme_minimal()
+```
+
+### Step 9 – Identify Top and Bottom Decile Stocks (Latest Date)
+
+```{r}
+# Get the latest date available in the data
+latest_date_india <- max(momentum_deciles_india$Date, na.rm = TRUE)
+
+# Extract top decile (highest momentum) stocks for that date
+top_decile_stocks_india <- momentum_deciles_india %>%
+  filter(Date == latest_date_india, Decile == 10) %>%
+  select(Stock, Momentum)
+
+# Extract bottom decile (lowest momentum) stocks for that date
+bottom_decile_stocks_india <- momentum_deciles_india %>%
+  filter(Date == latest_date_india, Decile == 1) %>%
+  select(Stock, Momentum)
+
+# Print the stocks in each group
+cat("Top Decile (Winners) on", latest_date_india, ":\n")
+print(top_decile_stocks_india)
+
+cat("\nBottom Decile (Losers) on", latest_date_india, ":\n")
+print(bottom_decile_stocks_india)
+
+```
+
+### Step 10 – Long–Short Strategy
+
+```{r}
+# Calculate long–short strategy returns: Decile 10 (long) minus Decile 1 (short)
+long_short_spread_india <- final_data_india %>%
+  filter(Decile %in% c(1, 10)) %>%    # Keep only top and bottom deciles
+  group_by(Date, Decile) %>%
+  summarise(Return = mean(ForwardReturn, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Decile, values_from = Return, names_prefix = "Decile") %>%
+  mutate(LongShort = Decile10 - Decile1) %>%   # Strategy return
+  arrange(Date)
+```
+
+```{r}
+# Plot cumulative return of long–short strategy over time
+long_short_spread_india <- long_short_spread_india %>%
+  mutate(CumulativeReturn = cumsum(replace_na(LongShort, 0)))  # Replace NAs with 0 to avoid breaks
+
+
+ggplot(long_short_spread_india, aes(x = Date, y = CumulativeReturn)) +
+  geom_line(color = "darkblue", size = 1.2) +
+  labs(
+    title = "Cumulative Return of Long–Short Momentum Strategy",
+    x = "Date",
+    y = "Cumulative Return"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Summary statistics for the long–short momentum strategy
+
+# Remove NA values for performance metrics
+spread_returns_india <- na.omit(long_short_spread_india$LongShort)
+
+# Compute mean return, volatility, and Sharpe ratio
+mean_return_india <- mean(spread_returns_india)
+volatility_india <- sd(spread_returns_india)
+sharpe_ratio_india <- mean_return_india / volatility_india
+
+# Display metrics in a nicely formatted table
+data.frame(
+  Mean = mean_return_india,
+  Volatility = volatility_india,
+  Sharpe_Ratio = sharpe_ratio_india
+) %>%
+  knitr::kable(digits = 4, caption = "Performance Metrics for Long–Short Momentum Strategy")
+```
+
+### Step 11 – Regression Analysis
+
+```{r}
+# Clean data to avoid NA issues
+regression_data_india <- final_data_india %>%
+  filter(!is.na(ForwardReturn), !is.na(Decile))
+
+# Regress forward returns on deciles
+model_india <- lm(ForwardReturn ~ Decile, data = regression_data_india)
+
+# View regression output
+summary(model_india)
+```
+
+## Cross-Country Comparative Analysis: Brazil, Mexico and India
+
+```{r}
+# Create performance metrics summary table
+metrics_comparison <- data.frame(
+  Country = c("Brazil", "Mexico", "India"),
+  Mean = c(mean_return_brazil, mean_return_mexico, mean_return_india),
+  Volatility = c(volatility_brazil, volatility_mexico, volatility_india),
+  Sharpe_Ratio = c(sharpe_ratio_brazil, sharpe_ratio_mexico, sharpe_ratio_india)
+)
+
+# Display with nice formatting
+metrics_comparison %>%
+  arrange(desc(Sharpe_Ratio)) %>%
+  knitr::kable(digits = 4, caption = "Performance Metrics Comparison: Long–Short Momentum Strategy")
+```
+
+```{r}
+# Add country label to each dataset
+long_short_spread_brazil$Country <- "Brazil"
+long_short_spread_mexico$Country <- "Mexico"
+long_short_spread_india$Country <- "India"
+
+# Combine all 3
+combined_cumulative <- bind_rows(
+  long_short_spread_brazil %>% select(Date, CumulativeReturn, Country),
+  long_short_spread_mexico %>% select(Date, CumulativeReturn, Country),
+  long_short_spread_india %>% select(Date, CumulativeReturn, Country)
+)
+
+# Plot all together
+ggplot(combined_cumulative, aes(x = Date, y = CumulativeReturn, color = Country)) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "📈 Cumulative Return Comparison: Long–Short Momentum Strategy",
+    x = "Date",
+    y = "Cumulative Return"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+# Identify best performer by each metric 
+best_sharpe <- metrics_comparison$Country[which.max(metrics_comparison$Sharpe_Ratio)]
+best_mean <- metrics_comparison$Country[which.max(metrics_comparison$Mean)]
+lowest_vol <- metrics_comparison$Country[which.min(metrics_comparison$Volatility)]
+
+cat("
+### Summary of Findings
+
+- Brazil had a Sharpe ratio of ", round(sharpe_ratio_brazil, 3), ", with a mean return of ", round(mean_return_brazil, 4), ".
+- Mexico had a Sharpe ratio of ", round(sharpe_ratio_mexico, 3), ", with a mean return of ", round(mean_return_mexico, 4), ".
+- India had a Sharpe ratio of ", round(sharpe_ratio_india, 3), ", with a mean return of ", round(mean_return_india, 4), ".
+
+### Ranking Overview
+
+- Best risk-adjusted performance (Sharpe ratio): ", best_sharpe, "
+- Highest average return: ", best_mean, "
+- Lowest volatility: ", lowest_vol, "
+
+Overall, the results indicate that ", best_sharpe, " offered the most favourable risk-adjusted return profile among the three markets analysed during the sample period.
+")
+```
+
+```{r}
+# Add country labels
+decile_summary_brazil$Country <- "Brazil"
+decile_summary_mexico$Country <- "Mexico"
+decile_summary_india$Country <- "India"
+
+# Combine all
+combined_deciles <- bind_rows(
+  decile_summary_brazil,
+  decile_summary_mexico,
+  decile_summary_india
+)
+
+# Plot faceted comparison
+ggplot(combined_deciles, aes(x = Decile, y = AvgForwardReturn)) +
+  geom_col(fill = "steelblue") +
+  facet_wrap(~ Country) +
+  labs(title = "Average 1-Month Forward Return by Momentum Decile",
+       x = "Momentum Decile",
+       y = "Average Forward Return") +
+  theme_minimal()
+```
+
+```{r}
+# Create individual country tables with renamed columns
+brazil_tbl <- decile_summary_brazil %>% select(Decile, Brazil = AvgForwardReturn)
+mexico_tbl <- decile_summary_mexico %>% select(Decile, Mexico = AvgForwardReturn)
+india_tbl  <- decile_summary_india  %>% select(Decile, India  = AvgForwardReturn)
+
+# Merge all country tables on Decile
+momentum_table <- full_join(brazil_tbl, mexico_tbl, by = "Decile") %>%
+  full_join(india_tbl, by = "Decile") %>%
+  arrange(Decile) %>%
+  filter(!is.na(Decile))  
+
+# Round values for readability
+momentum_table <- momentum_table %>%
+  mutate(across(-Decile, ~ round(., 4)))
+
+# Display the final table
+knitr::kable(momentum_table, caption = "Average 1-Month Forward Return by Momentum Decile Across Countries")
+```
+
+## Read and prepare MSCI EM benchmark
+
+```{r}
+# MSCI EM Benchmark 
+
+em_raw <- read_excel("Benchmark_IndexData.xlsx")  
+
+# Try to standardise columns
+em <- em_raw %>%
+  rename(Date = 1) %>%
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date)
+
+#  if there’s a single numeric column besides Date, treat it as Level; else look for 'Return'
+num_cols <- names(em)[sapply(em, is.numeric)]
+num_cols <- setdiff(num_cols, "Date")
+
+if (length(num_cols) >= 1 && !"Return" %in% names(em)) {
+  # Use the first numeric column as Level
+  lvl_col <- num_cols[1]
+  em <- em %>%
+    rename(Level = all_of(lvl_col)) %>%
+    mutate(EM_Forward = lead(Level) / Level - 1) %>%  
+    select(Date, EM_Forward)
+} else if ("Return" %in% names(em)) {
+  # If a Return column already exists and is contemporaneous t->t+1, rename it
+  em <- em %>%
+    rename(EM_Forward = Return) %>%
+    select(Date, EM_Forward)
+} else {
+  stop("MSCI EM file: couldn’t find a usable Level or Return column.")
+}
+```
+
+# 2) Run EM-alpha, excess returns, and plots
+
+```{r}
+analyze_vs_em <- function(ls_df, decile_df, country_label) {
+  # ls_df: data.frame with Date, LongShort
+  # decile_df: data.frame with Date, Dec10 (avg forward return of decile 10 each month)
+
+  # Merge EM
+  ls <- ls_df %>%
+    select(Date, LongShort) %>%
+    left_join(em, by = "Date") %>%
+    filter(!is.na(LongShort), !is.na(EM_Forward))
+
+  dec10 <- decile_df %>%
+    left_join(em, by = "Date") %>%
+    filter(!is.na(Dec10), !is.na(EM_Forward))
+
+  # Regressions (monthly)
+  capm_ls   <- lm(LongShort ~ EM_Forward, data = ls)
+  capm_dec10<- lm(Dec10 ~ EM_Forward, data = dec10)
+
+  # Annualisation helpers (assume monthly data)
+  ann <- function(x) {
+    m <- mean(x, na.rm = TRUE)
+    s <- sd(x, na.rm = TRUE)
+    list(
+      mean_ann = (1 + m)^12 - 1,
+      vol_ann  = s * sqrt(12),
+      sharpe_ann = ifelse(s == 0, NA, ( (1 + m)^12 - 1 ) / (s * sqrt(12)))
+    )
+  }
+
+  # Excess & IR for long-only
+  dec10_excess <- dec10$Dec10 - dec10$EM_Forward
+  IR_dec10 <- mean(dec10_excess, na.rm = TRUE) / sd(dec10_excess, na.rm = TRUE)
+
+  # Pack summaries
+  out <- list(
+    country = country_label,
+    ls_alpha = broom::tidy(capm_ls),
+    ls_glance = broom::glance(capm_ls),
+    dec10_alpha = broom::tidy(capm_dec10),
+    dec10_glance = broom::glance(capm_dec10),
+    ls_ann = ann(ls$LongShort),
+    dec10_ann = ann(dec10$Dec10),
+    dec10_ir = IR_dec10,
+    ls_excess_cum = ls %>% mutate(CumExcess = cumprod(1 + (LongShort - EM_Forward)) - 1),
+    dec10_excess_cum = dec10 %>% mutate(CumExcess = cumprod(1 + (Dec10 - EM_Forward)) - 1)
+  )
+  out
+}
+```
+
+# 3) Build Decile-10 (long-only) series per country
+
+```{r}
+# Brazil Decile 10 avg forward return each month
+dec10_brazil <- final_data_brazil %>%
+  filter(Decile == 10) %>%
+  group_by(Date) %>%
+  summarise(Dec10 = mean(ForwardReturn, na.rm = TRUE), .groups = "drop")
+
+# Mexico
+dec10_mexico <- final_data_mexico %>%
+  filter(Decile == 10) %>%
+  group_by(Date) %>%
+  summarise(Dec10 = mean(ForwardReturn, na.rm = TRUE), .groups = "drop")
+
+# India
+dec10_india <- final_data_india %>%
+  filter(Decile == 10) %>%
+  group_by(Date) %>%
+  summarise(Dec10 = mean(ForwardReturn, na.rm = TRUE), .groups = "drop")
+
+```
+
+# 4) Run analysis vs MSCI EM for each country
+
+```{r}
+res_br <- analyze_vs_em(
+  ls_df = long_short_spread_brazil,
+  decile_df = dec10_brazil,
+  country_label = "Brazil"
+)
+
+res_mx <- analyze_vs_em(
+  ls_df = long_short_spread_mexico,
+  decile_df = dec10_mexico,
+  country_label = "Mexico"
+)
+
+res_in <- analyze_vs_em(
+  ls_df = long_short_spread_india,
+  decile_df = dec10_india,
+  country_label = "India"
+)
+
+```
+
+# 5) Summaries and tables (alphas, betas, IR)
+
+```{r}
+# Long–Short CAPM vs EM (alpha, beta, t-stats)
+ls_tbl <- bind_rows(
+  res_br$ls_alpha %>% mutate(Country = "Brazil"),
+  res_mx$ls_alpha %>% mutate(Country = "Mexico"),
+  res_in$ls_alpha %>% mutate(Country = "India")
+) %>%
+  select(Country, term, estimate, std.error, statistic, p.value) %>%
+  mutate(term = recode(term, `(Intercept)` = "Alpha", `EM_Forward` = "Beta (EM)")) %>%
+  tidyr::pivot_wider(
+    names_from = term,
+    values_from = c(estimate, std.error, statistic, p.value)
+  )
+
+knitr::kable(ls_tbl, digits = 4, caption = "Long–Short vs MSCI EM: Alpha/Beta (Monthly)")
+```
+
+```{r}
+# Long-only Decile 10 CAPM vs EM + Information Ratio (excess)
+dec10_tbl <- bind_rows(
+  res_br$dec10_alpha %>% mutate(Country = "Brazil"),
+  res_mx$dec10_alpha %>% mutate(Country = "Mexico"),
+  res_in$dec10_alpha %>% mutate(Country = "India")
+) %>%
+  select(Country, term, estimate, std.error, statistic, p.value) %>%
+  mutate(term = recode(term, `(Intercept)` = "Alpha", `EM_Forward` = "Beta (EM)")) %>%
+  tidyr::pivot_wider(
+    names_from = term,
+    values_from = c(estimate, std.error, statistic, p.value)
+  ) %>%
+  left_join(
+    data.frame(
+      Country = c("Brazil","Mexico","India"),
+      Info_Ratio = c(res_br$dec10_ir, res_mx$dec10_ir, res_in$dec10_ir)
+    ),
+    by = "Country"
+  )
+
+knitr::kable(dec10_tbl, digits = 4, caption = "Decile 10 vs MSCI EM: Alpha/Beta (Monthly) and Information Ratio")
+```
+
+```{r}
+# Annualised performance (for context)
+ann_tbl <- tibble::tibble(
+  Country = c("Brazil","Mexico","India"),
+  LS_Mean_Ann = sapply(list(res_br$res, res_mx$res, res_in$res), function(x) NA) # placeholder to keep shape
+) %>% select(-LS_Mean_Ann) %>%
+  mutate(
+    LS_Mean_Ann = c(res_br$ls_ann$mean_ann, res_mx$ls_ann$mean_ann, res_in$ls_ann$mean_ann),
+    LS_Vol_Ann  = c(res_br$ls_ann$vol_ann,  res_mx$ls_ann$vol_ann,  res_in$ls_ann$vol_ann),
+    LS_Sharpe   = c(res_br$ls_ann$sharpe_ann, res_mx$ls_ann$sharpe_ann, res_in$ls_ann$sharpe_ann),
+    Dec10_Mean_Ann = c(res_br$dec10_ann$mean_ann, res_mx$dec10_ann$mean_ann, res_in$dec10_ann$mean_ann),
+    Dec10_Vol_Ann  = c(res_br$dec10_ann$vol_ann,  res_mx$dec10_ann$vol_ann,  res_in$dec10_ann$vol_ann),
+    Dec10_Sharpe   = c(res_br$dec10_ann$sharpe_ann, res_mx$dec10_ann$sharpe_ann, res_in$dec10_ann$sharpe_ann)
+  )
+
+knitr::kable(ann_tbl %>% mutate(across(-Country, round, 4)),
+             caption = "Annualised Performance (Monthly data)")
+```
+
+# 6) Cumulative **excess** plots vs MSCI EM
+
+```{r}
+# Long–Short excess vs EM
+ls_excess_all <- bind_rows(
+  res_br$ls_excess_cum %>% mutate(Country = "Brazil"),
+  res_mx$ls_excess_cum %>% mutate(Country = "Mexico"),
+  res_in$ls_excess_cum %>% mutate(Country = "India")
+)
+
+ggplot(ls_excess_all, aes(x = Date, y = CumExcess, colour = Country)) +
+  geom_line(size = 1.1) +
+  labs(title = "Cumulative Excess Return of Long–Short vs MSCI EM",
+       x = "Date", y = "Cumulative Excess Return") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# Decile 10 (long-only) excess vs EM
+dec10_excess_all <- bind_rows(
+  res_br$dec10_excess_cum %>% mutate(Country = "Brazil"),
+  res_mx$dec10_excess_cum %>% mutate(Country = "Mexico"),
+  res_in$dec10_excess_cum %>% mutate(Country = "India")
+)
+
+ggplot(dec10_excess_all, aes(x = Date, y = CumExcess, colour = Country)) +
+  geom_line(size = 1.1) +
+  labs(title = "Cumulative Excess Return of Decile 10 vs MSCI EM",
+       x = "Date", y = "Cumulative Excess Return") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+## Machine Learning Part
+
+```{r}
+country_list <- list(
+  Brazil = final_data_brazil,
+  Mexico = final_data_mexico,
+  India  = final_data_india
+)
+
+results <- list()
+
+for (country in names(country_list)) {
+  
+  cat("\n===== Machine Learning for", country, "=====\n")
+  
+  ml_data <- country_list[[country]] %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>%
+    mutate(
+      Momentum_lag1 = lag(Momentum, 1),
+      TopDecileThis = ifelse(Decile == 10, 1, 0)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(Momentum_lag1), !is.na(TopDecileThis))
+  
+  # Train/test split (time-based)
+  dates_sorted <- sort(unique(ml_data$Date))
+  split_point <- dates_sorted[floor(length(dates_sorted) * 0.8)]
+  
+  train_df <- ml_data %>% filter(Date <= split_point)
+  test_df  <- ml_data %>% filter(Date > split_point)
+  
+  # Random Forest classifier
+  set.seed(123)
+  rf_class <- randomForest(
+    as.factor(TopDecileThis) ~ Momentum_lag1,
+    data = train_df,
+    ntree = 500
+  )
+  
+  # Predict on test set
+  test_df$PredProb <- predict(rf_class, newdata = test_df, type = "prob")[, 2]
+  
+  # Evaluate AUC & Hit Rate
+  auc_score <- auc(test_df$TopDecileThis, test_df$PredProb)
+  hit_rate <- mean(
+    (test_df$PredProb >= 0.5 & test_df$TopDecileThis == 1) |
+    (test_df$PredProb < 0.5 & test_df$TopDecileThis == 0)
+  )
+  
+  cat("AUC:", round(auc_score, 4), "\n")
+  cat("Directional Accuracy (Hit Rate):", round(hit_rate, 4), "\n")
+  
+  # Build long–short portfolio
+  test_df <- test_df %>%
+    group_by(Date) %>%
+    mutate(
+      RankProb = rank(-PredProb, ties.method = "first"),
+      N = n(),
+      Position = case_when(
+        RankProb <= 0.1 * N ~ 1,   
+        RankProb > 0.9 * N  ~ -1,  
+        TRUE ~ 0
+      )
+    ) %>%
+    ungroup()
+  
+  pred_ls <- test_df %>%
+    group_by(Date) %>%
+    summarise(
+      LongShort = mean(ForwardReturn * Position, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(CumulativeReturn = cumprod(1 + replace_na(LongShort, 0)) - 1)
+  
+  results[[country]] <- list(
+    AUC = auc_score,
+    HitRate = hit_rate,
+    Portfolio = pred_ls
+  )
+  
+  # Plot for each country
+  print(
+    ggplot(pred_ls, aes(x = Date, y = CumulativeReturn)) +
+      geom_line(color = "darkgreen", size = 1.1) +
+      labs(
+        title = paste("Predicted Long–Short Portfolio (", country, ")", sep = ""),
+        x = "Date", y = "Cumulative Return"
+      ) +
+      theme_minimal()
+  )
+}
+# Combine all countries' portfolio results into one dataframe
+combined_results <- bind_rows(
+  lapply(names(results), function(country) {
+    results[[country]]$Portfolio %>% mutate(Country = country)
+  })
+)
+
+# Plot the combined chart
+ggplot(combined_results, aes(x = Date, y = CumulativeReturn, colour = Country)) +
+  geom_line(size = 1.1) +
+  labs(
+    title = "Predicted Long–Short Portfolio: All Countries",
+    x = "Date",
+    y = "Cumulative Return"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.title = element_blank()
+  )
+```
+
+```{r}
+# ML Portfolio vs Baseline & MSCI EM (ALL COUNTRIES)
+
+library(randomForest)
+library(pROC)
+library(broom)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(zoo)
+
+# Expectation: 'em' exists with columns: Date, EM_Forward (monthly forward return)
+stopifnot(all(c("Date","EM_Forward") %in% names(em)))
+
+ann_stats <- function(x) {
+  x <- na.omit(x); m <- mean(x); s <- sd(x)
+  tibble(
+    Mean_M = m,
+    Vol_M  = s,
+    Sharpe_M = ifelse(s == 0, NA, m/s),
+    Mean_Ann = (1+m)^12 - 1,
+    Vol_Ann  = s*sqrt(12),
+    Sharpe_Ann = ifelse(s == 0, NA, ((1+m)^12 - 1)/(s*sqrt(12)))
+  )
+}
+
+ml_vs_baseline <- function(final_data_country, country_label = "Country",
+                           top_frac = 0.10, split_frac = 0.8) {
+
+  # 1) Features (t-1) & target at t (leakage-free)
+  df <- final_data_country %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>%
+    mutate(
+      Momentum_lag1 = lag(Momentum, 1),
+      TopDecile_t   = ifelse(Decile == 10, 1, 0)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(Momentum_lag1), !is.na(TopDecile_t), !is.na(ForwardReturn))
+
+  # 2) Time split
+  dates_sorted <- sort(unique(df$Date))
+  split_point  <- dates_sorted[floor(length(dates_sorted) * split_frac)]
+  train_df <- df %>% filter(Date <= split_point)
+  test_df  <- df %>% filter(Date >  split_point)
+
+  # 3) Train classifier
+  set.seed(123)
+  rf <- randomForest(as.factor(TopDecile_t) ~ Momentum_lag1,
+                     data = train_df, ntree = 500, mtry = 1, importance = TRUE)
+
+  # 4) Predict & metrics
+  test_df$PredProb <- predict(rf, newdata = test_df, type = "prob")[,2]
+  auc_val  <- as.numeric(pROC::auc(test_df$TopDecile_t, test_df$PredProb))
+  hit_rate <- mean((test_df$PredProb >= 0.5 & test_df$TopDecile_t == 1) |
+                   (test_df$PredProb <  0.5 & test_df$TopDecile_t == 0))
+
+  # 5) Predicted ML long–short (equal-weight each month)
+  test_df <- test_df %>%
+    group_by(Date) %>%
+    mutate(
+      N = n(),
+      RankProb = rank(-PredProb, ties.method = "first"),
+      Position = case_when(
+        RankProb <= top_frac * N ~  1,
+        RankProb >  (1 - top_frac) * N ~ -1,
+        TRUE ~ 0
+      )
+    ) %>% ungroup()
+
+  pred_ls <- test_df %>%
+    group_by(Date) %>%
+    summarise(LS_ML = mean(ForwardReturn * Position, na.rm = TRUE), .groups = "drop")
+
+  # 6) Baseline long–short (Decile10 - Decile1) on same test window
+  base_ls <- final_data_country %>%
+    group_by(Date, Decile) %>%
+    summarise(R = mean(ForwardReturn, na.rm = TRUE), .groups = "drop") %>%
+    filter(Decile %in% c(1,10)) %>%
+    pivot_wider(names_from = Decile, values_from = R, names_prefix = "D") %>%
+    mutate(LS_Base = D10 - D1) %>%
+    select(Date, LS_Base) %>%
+    filter(Date > split_point)
+
+  # 7) Merge with MSCI EM and compute CAPM alphas
+  cmp <- pred_ls %>%
+    full_join(base_ls, by = "Date") %>%
+    left_join(em, by = "Date") %>%
+    arrange(Date) %>%
+    filter(!is.na(EM_Forward))
+
+  capm_ml   <- lm(LS_ML   ~ EM_Forward, data = cmp)
+  capm_base <- lm(LS_Base ~ EM_Forward, data = cmp)
+
+  # 8) Tables
+  stats_tbl <- bind_rows(
+    ann_stats(cmp$LS_ML)   %>% mutate(Series = "ML Long–Short"),
+    ann_stats(cmp$LS_Base) %>% mutate(Series = "Baseline Long–Short"),
+    ann_stats(cmp$EM_Forward) %>% mutate(Series = "MSCI EM")
+  ) %>% relocate(Series)
+
+  alpha_tbl <- bind_rows(
+    broom::tidy(capm_ml)   %>% mutate(Series = "ML Long–Short"),
+    broom::tidy(capm_base) %>% mutate(Series = "Baseline Long–Short")
+  ) %>%
+    mutate(term = recode(term, `(Intercept)` = "Alpha", `EM_Forward` = "Beta (EM)")) %>%
+    select(Series, term, estimate, std.error, statistic, p.value) %>%
+    pivot_wider(names_from = term,
+                values_from = c(estimate, std.error, statistic, p.value))
+
+  # 9) Plot per country (compounded cum returns)
+  plot_df <- cmp %>%
+    transmute(
+      Date,
+      `ML Long–Short`        = cumprod(1 + replace_na(LS_ML,   0)) - 1,
+      `Baseline Long–Short`  = cumprod(1 + replace_na(LS_Base, 0)) - 1,
+      `MSCI EM`              = cumprod(1 + EM_Forward) - 1
+    ) %>%
+    pivot_longer(-Date, names_to = "Series", values_to = "CumReturn")
+
+  p <- ggplot(plot_df, aes(x = Date, y = CumReturn, colour = Series)) +
+    geom_line(size = 1.1) +
+    labs(title = paste0(country_label, ": Cumulative Returns (Test Period)"),
+         x = "Date", y = "Cumulative Return") +
+    theme_minimal() + theme(legend.position = "bottom")
+
+  list(
+    country   = country_label,
+    auc       = auc_val,
+    hit_rate  = hit_rate,
+    stats     = stats_tbl,
+    alpha_tbl = alpha_tbl,
+    plot      = p,
+    ml_series = plot_df %>% filter(Series == "ML Long–Short") %>%
+                 transmute(Date, CumReturn, Country = country_label),
+    feat_imp  = as.data.frame(importance(rf)) %>% tibble::rownames_to_column("Feature")
+  )
+}
+
+# ---------- Run for all three countries ----------
+res_br <- ml_vs_baseline(final_data_brazil, country_label = "Brazil")
+res_mx <- ml_vs_baseline(final_data_mexico, country_label = "Mexico")
+res_in <- ml_vs_baseline(final_data_india,  country_label = "India")
+
+# Print key metrics and tables
+cat("Brazil — AUC:", round(res_br$auc, 4), " | Hit Rate:", round(res_br$hit_rate, 4), "\n")
+knitr::kable(res_br$stats %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "Brazil: Monthly & Annualised Performance (Test Period)")
+knitr::kable(res_br$alpha_tbl %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "Brazil: Alpha/Beta vs MSCI EM (Monthly CAPM)")
+print(res_br$plot)
+
+cat("Mexico — AUC:", round(res_mx$auc, 4), " | Hit Rate:", round(res_mx$hit_rate, 4), "\n")
+knitr::kable(res_mx$stats %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "Mexico: Monthly & Annualised Performance (Test Period)")
+knitr::kable(res_mx$alpha_tbl %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "Mexico: Alpha/Beta vs MSCI EM (Monthly CAPM)")
+print(res_mx$plot)
+
+cat("India  — AUC:", round(res_in$auc, 4), " | Hit Rate:", round(res_in$hit_rate, 4), "\n")
+knitr::kable(res_in$stats %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "India: Monthly & Annualised Performance (Test Period)")
+knitr::kable(res_in$alpha_tbl %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "India: Alpha/Beta vs MSCI EM (Monthly CAPM)")
+print(res_in$plot)
+
+# ---------- One combined ML-only cumulative plot (all countries) ----------
+combined_ml <- bind_rows(res_br$ml_series, res_mx$ml_series, res_in$ml_series) %>%
+  mutate(Country = factor(Country, levels = c("Brazil","Mexico","India")))
+
+ggplot(combined_ml, aes(x = Date, y = CumReturn, colour = Country)) +
+  geom_line(size = 1.1) +
+  labs(title = "ML Long–Short: Cumulative Returns by Country (Test Period)",
+       x = "Date", y = "Cumulative Return") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+
+```
+
+```{r}
+# Predicted vs Actual (Hexbin) — OOS Return Forecast 
+# Simple regression model: predict ForwardReturn_t from Momentum_{t-1}
+# Produces a hexbin-style Predicted vs Actual plot + MAE/RMSE/R^2 per country
+
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+pred_vs_actual_plot <- function(final_data_country, country_label = "Country", split_frac = 0.8) {
+  df <- final_data_country %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>%
+    mutate(Momentum_lag1 = dplyr::lag(Momentum, 1)) %>%
+    ungroup() %>%
+    filter(!is.na(Momentum_lag1), !is.na(ForwardReturn))
+
+  # Time-based split
+  dates_sorted <- sort(unique(df$Date))
+  split_point  <- dates_sorted[floor(length(dates_sorted) * split_frac)]
+  train_df <- df %>% filter(Date <= split_point)
+  test_df  <- df %>% filter(Date >  split_point)
+
+  # Random Forest REGRESSION (forecast ForwardReturn)
+  set.seed(123)
+  rf_reg <- randomForest(ForwardReturn ~ Momentum_lag1,
+                         data = train_df, ntree = 500, mtry = 1)
+
+  # OOS predictions
+  test_df$Pred <- predict(rf_reg, newdata = test_df)
+
+  # Metrics
+  mae  <- mean(abs(test_df$ForwardReturn - test_df$Pred), na.rm = TRUE)
+  rmse <- sqrt(mean((test_df$ForwardReturn - test_df$Pred)^2, na.rm = TRUE))
+  r2   <- cor(test_df$ForwardReturn, test_df$Pred, use = "complete.obs")^2
+
+  # Hexbin-style plot (use 2D binning)
+  p <- ggplot(test_df, aes(x = Pred, y = ForwardReturn)) +
+    stat_bin2d(bins = 40) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    scale_fill_gradient(name = "Count", low = "#c6efff", high = "#ff3b30") +
+    labs(
+      title = paste0(country_label, " — Predicted vs Actual (OOS)"),
+      subtitle = paste0("MAE: ", round(mae, 4),
+                        " | RMSE: ", round(rmse, 4),
+                        " | R²: ", round(r2, 4)),
+      x = "Predicted Next-Month Return",
+      y = "Actual Next-Month Return"
+    ) +
+    theme_minimal()
+
+  list(plot = p, mae = mae, rmse = rmse, r2 = r2)
+}
+
+# ---- Run for all three countries and print plots ----
+p_br <- pred_vs_actual_plot(final_data_brazil, "Brazil")
+p_mx <- pred_vs_actual_plot(final_data_mexico, "Mexico")
+p_in <- pred_vs_actual_plot(final_data_india,  "India")
+
+print(p_br$plot)
+print(p_mx$plot)
+print(p_in$plot)
+
+```
+
+## highest-impact ML upgrades
+
+### 1) Walk-forward (expanding window) validation
+
+```{r}
+# ---- Walk-forward expanding-window for one country (RF classifier) ----
+wf_ml <- function(df, start_frac = 0.5, step = 1, top_frac = 0.10) {
+  df <- df %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>% mutate(Momentum_lag1 = lag(Momentum, 1)) %>% ungroup() %>%
+    filter(!is.na(Momentum_lag1), !is.na(ForwardReturn), !is.na(Decile)) %>%
+    mutate(TopDecile_t = as.integer(Decile == 10))
+
+  dates <- sort(unique(df$Date))
+  start_i <- floor(length(dates) * start_frac)
+  out <- list(pred=NULL, ls=NULL, auc=NULL, hit=NULL)
+
+  for (i in seq(from = start_i, to = length(dates) - 1, by = step)) {
+    train_end <- dates[i]
+    test_date <- dates[i + 1]  # 1-month embargo by construction
+
+    tr <- df %>% filter(Date <= train_end)
+    te <- df %>% filter(Date == test_date)
+
+    set.seed(123)
+    rf <- randomForest::randomForest(
+      as.factor(TopDecile_t) ~ Momentum_lag1,
+      data = tr, ntree = 500, mtry = 1
+    )
+
+    te$PredProb <- predict(rf, newdata = te, type = "prob")[,2]
+
+    # AUC / hit for this test month
+    out$auc <- c(out$auc, pROC::auc(te$TopDecile_t, te$PredProb))
+    out$hit <- c(out$hit, mean((te$PredProb >= 0.5 & te$TopDecile_t == 1) |
+                               (te$PredProb < 0.5  & te$TopDecile_t == 0)))
+
+    # Long-short for this month (exact neutrality)
+    te <- te %>% mutate(rk = rank(-PredProb, ties.method="first"),
+                        N = n(),
+                        pos = dplyr::case_when(
+                          rk <= top_frac*N ~  1,
+                          rk >  (1-top_frac)*N ~ -1,
+                          TRUE ~ 0))
+
+    ret_month <- mean(te$ForwardReturn[te$pos== 1], na.rm=TRUE) -
+                 mean(te$ForwardReturn[te$pos==-1], na.rm=TRUE)
+
+    out$ls <- dplyr::bind_rows(out$ls, tibble::tibble(Date=test_date, LS_ML=ret_month))
+    out$pred <- dplyr::bind_rows(out$pred, te %>% dplyr::select(Date, Stock, PredProb))
+  }
+  out
+}
+
+```
+
+Run per country:
+
+```{r}
+wf_br <- wf_ml(final_data_brazil)
+wf_mx <- wf_ml(final_data_mexico)
+wf_in <- wf_ml(final_data_india)
+
+```
+
+## 2) Transaction costs & turnover (make it realistic)
+
+Add net performance after costs. Example for a long–short series `ls_df` and **per-side cost** `tc` (e.g., 25 bps = 0.0025):
+
+```{r}
+# ls_positions is the per-name Position matrix already build each month
+
+turnover_from_positions <- function(pos_df) {
+  # pos_df: Date, Stock, Position in {-1,0,1}
+  pos_df %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>% mutate(prev = dplyr::lag(Position, 1)) %>% ungroup() %>%
+    mutate(chg = abs((Position - dplyr::coalesce(prev, 0)))) %>%
+    group_by(Date) %>% summarise(Turnover = mean(chg, na.rm=TRUE)/2, .groups="drop")
+    # /2 since a round-trip (0->1->0) counts two one-way trades
+}
+
+# Join with returns and subtract costs
+apply_costs <- function(ls_ret_df, turnover_df, tc = 0.0025) {
+  ls_ret_df %>%
+    left_join(turnover_df, by="Date") %>%
+    mutate(Turnover = dplyr::coalesce(Turnover, 0),
+           Net = LS_ML - tc * Turnover) %>%
+    mutate(Cum_Gross = cumprod(1 + dplyr::coalesce(LS_ML,0)) - 1,
+           Cum_Net   = cumprod(1 + dplyr::coalesce(Net,0))   - 1)
+}
+
+```
+
+## 3) Tune the portfolio **breadth** (top/bottom %) out-of-sample
+
+```{r}
+breadth_test <- function(test_df) {
+  fracs <- c(0.05, 0.10, 0.20)
+  out <- purrr::map_dfr(fracs, function(f){
+    tmp <- test_df %>%
+      group_by(Date) %>%
+      mutate(N=n(), r=rank(-PredProb, ties.method="first"),
+             pos = case_when(r <= f*N ~ 1,
+                             r > (1-f)*N ~ -1, TRUE ~ 0)) %>%
+      ungroup() %>%
+      group_by(Date) %>%
+      summarise(LS = mean(ForwardReturn[pos==1], na.rm=TRUE) -
+                     mean(ForwardReturn[pos==-1], na.rm=TRUE), .groups="drop")
+    tibble::tibble(Frac=f,
+                   Mean=mean(tmp$LS, na.rm=TRUE),
+                   Vol=sd(tmp$LS, na.rm=TRUE),
+                   Sharpe=Mean/Vol)
+  })
+  out
+}
+
+```
+
+## 4) Ensemble = ML score + classic momentum rank
+
+```{r}
+# Within each date, z-score both signals then average
+ensemble_scores <- function(df_with_preds) {
+  df_with_preds %>%
+    group_by(Date) %>%
+    mutate(
+      z_ml  = scale(PredProb),
+      z_mom = scale(Momentum_lag1),
+      Score = 0.5 * as.numeric(z_ml) + 0.5 * as.numeric(z_mom)
+    ) %>%
+    ungroup()
+}
+
+```
+
+## 5) Statistical significance of alphas (Newey–West)
+
+```{r}
+# install.packages(c("sandwich","lmtest"))
+library(sandwich); library(lmtest)
+nw_alpha <- function(ret, mkt){
+  m <- lm(ret ~ mkt)
+  co <- coeftest(m, vcov = NeweyWest(m, lag = 3, prewhite = FALSE))
+  co  # alpha is the intercept row
+}
+# Example: nw_alpha(cmp$LS_ML, cmp$EM_Forward)
+
+```
+
+## 6) Class imbalance & threshold tuning
+
+```{r}
+# --- Balanced RF diagnostics (robust) ---
+library(pROC)
+
+# 1) Pick the target (0/1) and probability columns that actually exist
+target_col <- if ("TopDecile_t" %in% names(test_df)) {
+  "TopDecile_t"
+} else if ("TopDecileThis" %in% names(test_df)) {
+  "TopDecileThis"
+} else {
+  stop("Could not find TopDecile_t / TopDecileThis in test_df.")
+}
+
+prob_col <- if ("PredProb_bal" %in% names(test_df)) {
+  "PredProb_bal"
+} else if ("PredProb" %in% names(test_df)) {
+  "PredProb"
+} else {
+  stop("Could not find PredProb_bal / PredProb in test_df.")
+}
+
+# 2) Keep only valid rows and coerce the label to a 0/1 factor
+diag_df <- test_df |>
+  dplyr::select(Label = dplyr::all_of(target_col),
+                Score = dplyr::all_of(prob_col)) |>
+  dplyr::filter(!is.na(Label), !is.na(Score))
+
+# Quick sanity check 
+# print(table(diag_df$Label))
+
+if (nrow(diag_df) == 0) stop("No valid rows for ROC after NA filtering.")
+
+# Ensure factor with levels "0","1" (controls < cases)
+diag_df$Label <- factor(as.character(diag_df$Label), levels = c("0","1"))
+
+# 3) ROC with Youden-optimal threshold
+roc_obj <- pROC::roc(
+  response  = diag_df$Label,
+  predictor = diag_df$Score,
+  levels    = c("0","1"),
+  direction = "<",
+  quiet     = TRUE
+)
+
+best <- pROC::coords(roc_obj, x = "best", best.method = "youden",
+                     ret = c("threshold","sensitivity","specificity"))
+best_thr <- as.numeric(best["threshold"])
+
+# 4) Metrics at tuned threshold
+pred_label <- as.integer(diag_df$Score >= best_thr)  # 1 if score >= thr else 0
+auc_bal    <- as.numeric(pROC::auc(roc_obj))
+hit_bal    <- mean((pred_label == 1 & diag_df$Label == "1") |
+                   (pred_label == 0 & diag_df$Label == "0"))
+
+cat("Balanced RF — AUC:", round(auc_bal,4),
+    "| Hit Rate (tuned):", round(hit_bal,4),
+    "| Threshold:", round(best_thr,3), "\n")
+
+# Optional: confusion matrix + precision/recall/F1
+cm <- table(Actual = diag_df$Label,
+            Predicted = factor(pred_label, levels = c(0,1), labels = c("0","1")))
+precision <- ifelse(sum(cm[ , "1"]) == 0, NA, cm["1","1"] / sum(cm[ , "1"]))
+recall    <- cm["1","1"] / sum(cm["1", ])
+f1        <- ifelse(is.na(precision) | is.na(recall) | (precision+recall)==0,
+                    NA, 2*precision*recall/(precision+recall))
+cat("Precision:", round(precision,4),
+    "| Recall:", round(recall,4),
+    "| F1:", round(f1,4), "\n")
+
+```
+
+```{r}
+# Walk-Forward Summary + Costs + Breadth (ALL COUNTRIES) 
+
+# 1) Walk-forward expanding window, returns predictions, positions, AUC/Hit
+wf_ml_full <- function(df, start_frac = 0.5, step = 1, top_frac = 0.10) {
+  panel <- df %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>% mutate(Momentum_lag1 = dplyr::lag(Momentum, 1)) %>% ungroup() %>%
+    filter(!is.na(Momentum_lag1), !is.na(ForwardReturn), !is.na(Decile)) %>%
+    mutate(TopDecile = as.integer(Decile == 10))
+
+  dates <- sort(unique(panel$Date))
+  start_i <- floor(length(dates) * start_frac)
+
+  out <- list(ls = NULL, auc_month = NULL, positions = NULL, pred = NULL)
+
+  for (i in seq(from = start_i, to = length(dates) - 1, by = step)) {
+    train_end <- dates[i]
+    test_date <- dates[i + 1]
+
+    tr <- panel %>% filter(Date <= train_end)
+    te <- panel %>% filter(Date == test_date)
+
+    set.seed(123)
+    rf <- randomForest::randomForest(
+      as.factor(TopDecile) ~ Momentum_lag1,
+      data = tr, ntree = 500, mtry = 1
+    )
+
+    te$PredProb <- predict(rf, newdata = te, type = "prob")[,2]
+    auc_val <- as.numeric(pROC::auc(te$TopDecile, te$PredProb))
+    hit_val <- mean((te$PredProb >= 0.5 & te$TopDecile == 1) |
+                    (te$PredProb <  0.5 & te$TopDecile == 0))
+
+    te <- te %>%
+      mutate(
+        N  = n(),
+        rk = rank(-PredProb, ties.method = "first"),
+        Position = case_when(
+          rk <= top_frac * N ~  1,
+          rk >  (1 - top_frac) * N ~ -1,
+          TRUE ~ 0
+        )
+      )
+
+    ret_month <- mean(te$ForwardReturn[te$Position ==  1], na.rm = TRUE) -
+                 mean(te$ForwardReturn[te$Position == -1], na.rm = TRUE)
+
+    out$ls        <- bind_rows(out$ls, tibble(Date = test_date, LS_Gross = ret_month))
+    out$auc_month <- bind_rows(out$auc_month, tibble(Date = test_date, AUC = auc_val, Hit = hit_val))
+    out$positions <- bind_rows(out$positions, te %>% select(Date, Stock, Position))
+    out$pred      <- bind_rows(out$pred, te %>% select(Date, Stock, PredProb, ForwardReturn))
+  }
+  out
+}
+
+# 2) Turnover from positions & apply costs to get net series
+turnover_from_positions <- function(pos_df) {
+  pos_df %>%
+    arrange(Stock, Date) %>%
+    group_by(Stock) %>% mutate(prev = dplyr::lag(Position, 1)) %>% ungroup() %>%
+    mutate(chg = abs(Position - dplyr::coalesce(prev, 0))) %>%
+    group_by(Date) %>%
+    summarise(Turnover = mean(chg, na.rm = TRUE) / 2, .groups = "drop")
+}
+
+compute_net_perf <- function(wf_obj, tc = 0.0025) {  # tc = 25 bps per one-way
+  turn <- turnover_from_positions(wf_obj$positions)
+  perf <- wf_obj$ls %>%
+    left_join(turn, by = "Date") %>%
+    mutate(Turnover = dplyr::coalesce(Turnover, 0),
+           LS_Net   = LS_Gross - tc * Turnover,
+           Cum_Gross = cumprod(1 + dplyr::coalesce(LS_Gross, 0)) - 1,
+           Cum_Net   = cumprod(1 + dplyr::coalesce(LS_Net,   0)) - 1)
+  list(
+    perf   = perf,
+    gross  = ann_stats(wf_obj$ls$LS_Gross),
+    net    = ann_stats(perf$LS_Net)
+  )
+}
+
+# 3) Breadth robustness using stored predictions
+breadth_from_preds <- function(pred_panel, fracs = c(0.05, 0.10, 0.20)) {
+  purrr::map_dfr(fracs, function(f){
+    tmp <- pred_panel %>%
+      group_by(Date) %>%
+      mutate(N = n(),
+             rk = rank(-PredProb, ties.method = "first"),
+             pos = case_when(rk <= f*N ~  1,
+                             rk > (1-f)*N ~ -1,
+                             TRUE ~ 0)) %>%
+      ungroup() %>%
+      group_by(Date) %>%
+      summarise(LS = mean(ForwardReturn[pos==1], na.rm=TRUE) -
+                     mean(ForwardReturn[pos==-1], na.rm=TRUE),
+                .groups = "drop")
+    tibble(
+      Frac = f,
+      Mean_M = mean(tmp$LS, na.rm=TRUE),
+      Vol_M  = sd(tmp$LS, na.rm=TRUE),
+      Sharpe_M = ifelse(sd(tmp$LS, na.rm=TRUE)==0, NA, mean(tmp$LS, na.rm=TRUE)/sd(tmp$LS, na.rm=TRUE)),
+      Mean_Ann = (1+Mean_M)^12 - 1,
+      Vol_Ann  = Vol_M * sqrt(12),
+      Sharpe_Ann = ifelse(Vol_M == 0, NA, ((1+Mean_M)^12 - 1)/(Vol_M*sqrt(12)))
+    )
+  })
+}
+
+# Run for all three countries 
+wf_br <- wf_ml_full(final_data_brazil, start_frac = 0.5, top_frac = 0.10)
+wf_mx <- wf_ml_full(final_data_mexico, start_frac = 0.5, top_frac = 0.10)
+wf_in <- wf_ml_full(final_data_india,  start_frac = 0.5, top_frac = 0.10)
+
+# Step 1: Average AUC/Hit across test months
+auc_hit_tbl <- tibble::tibble(
+  Country = c("Brazil","Mexico","India"),
+  AUC_Avg = c(mean(wf_br$auc_month$AUC, na.rm=TRUE),
+              mean(wf_mx$auc_month$AUC, na.rm=TRUE),
+              mean(wf_in$auc_month$AUC, na.rm=TRUE)),
+  Hit_Avg = c(mean(wf_br$auc_month$Hit, na.rm=TRUE),
+              mean(wf_mx$auc_month$Hit, na.rm=TRUE),
+              mean(wf_in$auc_month$Hit, na.rm=TRUE))
+)
+knitr::kable(auc_hit_tbl %>% mutate(across(-Country, ~round(.,4))),
+             caption = "Walk-Forward: Average AUC and Hit Rate (Test Months)")
+
+#Step 2: Net vs Gross Sharpe (with costs) + Plot cum returns
+tc <- 0.0025  # 25 bps per one-way trade; adjust as needed
+
+net_br <- compute_net_perf(wf_br, tc = tc)
+net_mx <- compute_net_perf(wf_mx, tc = tc)
+net_in <- compute_net_perf(wf_in, tc = tc)
+
+gn_tbl <- bind_rows(
+  net_br$gross %>% mutate(Country="Brazil", Series="Gross"),
+  net_br$net   %>% mutate(Country="Brazil", Series="Net"),
+  net_mx$gross %>% mutate(Country="Mexico", Series="Gross"),
+  net_mx$net   %>% mutate(Country="Mexico", Series="Net"),
+  net_in$gross %>% mutate(Country="India",  Series="Gross"),
+  net_in$net   %>% mutate(Country="India",  Series="Net")
+) %>% relocate(Country, Series)
+
+knitr::kable(gn_tbl %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = paste0("Walk-Forward Long–Short: Gross vs Net (tc = ", tc, " per side)"))
+
+# Cumulative Gross vs Net plots (one per country)
+plot_gn <- function(perf_df, title_prefix){
+  ggplot(perf_df %>% select(Date, Cum_Gross, Cum_Net) %>%
+           pivot_longer(-Date, names_to="Series", values_to="Cum"),
+         aes(x=Date, y=Cum, colour=Series)) +
+    geom_line(size=1.1) +
+    labs(title = paste0(title_prefix, " — Walk-Forward Cumulative Returns"),
+         x="Date", y="Cumulative Return") +
+    theme_minimal() + theme(legend.position="bottom")
+}
+print(plot_gn(net_br$perf, "Brazil"))
+print(plot_gn(net_mx$perf, "Mexico"))
+print(plot_gn(net_in$perf, "India"))
+
+# Step 3: Breadth robustness (5%, 10%, 20%)
+breadth_tbl <- bind_rows(
+  breadth_from_preds(wf_br$pred) %>% mutate(Country="Brazil"),
+  breadth_from_preds(wf_mx$pred) %>% mutate(Country="Mexico"),
+  breadth_from_preds(wf_in$pred)  %>% mutate(Country="India")
+) %>% relocate(Country, Frac)
+
+knitr::kable(breadth_tbl %>% mutate(across(where(is.numeric), ~round(.,4))),
+             caption = "Breadth Robustness (Top/Bottom Fraction): Monthly & Annualised Stats")
+
+```

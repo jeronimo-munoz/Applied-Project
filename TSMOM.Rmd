@@ -1,0 +1,182 @@
+---
+title: "TSMOM"
+author: "Jeronimo Munoz"
+date: "2025-07-19"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) 
+```
+
+#### 1. **Load the data**
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(PerformanceAnalytics)
+library(xts)
+library(broom)
+
+
+# Load the Excel file
+data <- read_excel("C:/Data One Drive/Escritorio/Applied Project/TSMOM_IndexData.xlsx")
+
+# Convert Date column
+data <- data %>% mutate(Date = as.Date(Date))
+```
+
+#### 2. **Convert to Monthly Returns**
+
+```{r}
+# Step 2 – Convert to Monthly (simple) returns
+returns <- data %>%
+  arrange(Date) %>%
+  mutate(across(-Date, ~ . / lag(.) - 1)) %>%
+  drop_na()
+```
+
+#### 3. building the **12-month signal**
+
+```{r}
+# Calculate 12-month past return (TSMOM signal)
+signal <- data %>%
+  arrange(Date) %>%
+  mutate(across(-Date, ~(. / lag(., 12)) - 1, .names = "signal_{col}")) %>%
+  select(Date, starts_with("signal_")) %>%
+  drop_na()
+```
+
+#### 4. **Shift signals forward and apply them to next month’s returns**
+
+```{r}
+# Get the index names (exclude "Date")
+index_names <- names(returns)[names(returns) != "Date"]
+
+# Create a copy of returns to store strategy results
+strategy_returns <- returns
+
+# Loop over each index
+for (i in index_names) {
+  signal_col <- paste0("signal_", i)
+  tsmom_col  <- paste0("TSMOM_", i)
+  
+  # Multiply return by the lagged signal
+  strategy_returns[[tsmom_col]] <- returns[[i]] * sign(dplyr::lag(signal[[signal_col]]))
+}
+
+# (Optional) Keep only strategy return columns and Date
+strategy_returns_only <- strategy_returns %>%
+  select(Date, starts_with("TSMOM_"))
+
+# View result
+head(strategy_returns_only)
+```
+
+#### 5. **Aggregate Portfolio Return (equal weight)**
+
+```{r}
+# Step 5: Compute equal-weighted TSMOM portfolio
+tsmom_portfolio <- strategy_returns %>%
+  select(Date, starts_with("TSMOM_")) %>%
+  mutate(TSMOM_Portfolio = rowMeans(select(., starts_with("TSMOM_")), na.rm = TRUE))
+
+# View the first few rows
+head(tsmom_portfolio)
+```
+
+**Step 6 – Cumulative Returns Plot**
+
+```{r}
+# Step 6: Clean and calculate cumulative returns
+tsmom_portfolio_clean <- tsmom_portfolio %>%
+  filter(!is.na(TSMOM_Portfolio)) %>%
+  mutate(Cumulative_Return = cumprod(1 + TSMOM_Portfolio) - 1)
+
+# Plot
+ggplot(tsmom_portfolio_clean, aes(x = Date, y = Cumulative_Return)) +
+  geom_line(color = "steelblue", size = 1) +
+  labs(title = "Cumulative Returns of Equal-Weighted TSMOM Portfolio",
+       x = "Date", y = "Cumulative Return") +
+  theme_minimal()
+
+
+```
+
+```{r}
+# ===== Step 7 — MSCI EM (MXEF) Benchmark: load, align, compare 
+
+# Sanity: ensure TSMOM data exists
+stopifnot(all(c("Date","TSMOM_Portfolio","Cumulative_Return") %in% names(tsmom_portfolio_clean)))
+
+mxef_raw <- read_excel("Benchmark_IndexData.xlsx")
+
+mxef_tsmom <- mxef_raw %>%
+  rename(Date = 1) %>%                     # first column is Date
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date)
+
+# Prefer an explicit 'Return' column; else derive simple returns from first numeric level column
+num_cols <- names(mxef_tsmom)[sapply(mxef_tsmom, is.numeric)]
+num_cols <- setdiff(num_cols, "Date")
+
+if ("Return" %in% names(mxef_tsmom)) {
+  mxef_tsmom <- mxef_tsmom %>% rename(MXEF_Return = Return)
+} else if (length(num_cols) >= 1) {
+  lvl <- num_cols[1]
+  mxef_tsmom <- mxef_tsmom %>%
+    rename(Level = all_of(lvl)) %>%
+    mutate(MXEF_Return = Level / lag(Level) - 1)
+} else {
+  stop("Benchmark_IndexData.xlsx must contain either a 'Return' column or an index level column.")
+}
+
+mxef_tsmom <- mxef_tsmom %>%
+  select(Date, MXEF_Return) %>%
+  mutate(MXEF_CumReturn = cumprod(1 + dplyr::coalesce(MXEF_Return, 0)) - 1)
+
+# Merge with TSMOM portfolio
+merged_tsmom <- tsmom_portfolio_clean %>% inner_join(mxef_tsmom, by = "Date")
+
+# Cumulative returns plot: TSMOM vs MSCI EM
+print(
+  ggplot(merged_tsmom, aes(x = Date)) +
+    geom_line(aes(y = Cumulative_Return, colour = "TSMOM Portfolio"), size = 1) +
+    geom_line(aes(y = MXEF_CumReturn,   colour = "MSCI EM (MXEF)"), size = 1, linetype = "dashed") +
+    labs(title = "Cumulative Returns — TSMOM Portfolio vs MSCI EM (MXEF)",
+         x = "Date", y = "Cumulative Return") +
+    scale_color_manual(values = c("TSMOM Portfolio" = "steelblue", "MSCI EM (MXEF)" = "darkred")) +
+    theme_minimal() + theme(legend.position = "bottom")
+)
+
+# Monthly performance table (TSMOM vs MXEF)
+xts_tsmom <- xts::xts(merged_tsmom[, c("TSMOM_Portfolio","MXEF_Return")], order.by = merged_tsmom$Date)
+stats_tsmom <- rbind(
+  PerformanceAnalytics::Return.cumulative(xts_tsmom),
+  PerformanceAnalytics::Return.annualized(xts_tsmom),
+  PerformanceAnalytics::StdDev.annualized(xts_tsmom),
+  PerformanceAnalytics::SharpeRatio.annualized(xts_tsmom, Rf = 0),
+  PerformanceAnalytics::maxDrawdown(xts_tsmom)
+)
+rownames(stats_tsmom) <- c("Cumulative Return","Annualized Return","Annualized Volatility","Sharpe Ratio","Max Drawdown")
+colnames(stats_tsmom) <- c("TSMOM Portfolio","MSCI EM (MXEF)")
+knitr::kable(round(stats_tsmom, 4), caption = "TSMOM vs MSCI EM — Monthly Performance")
+
+# CAPM-style regression: TSMOM ~ MXEF
+capm_tsmom <- lm(TSMOM_Portfolio ~ MXEF_Return, data = merged_tsmom)
+print(summary(capm_tsmom))
+
+# Neat alpha/beta table (good for the write-up)
+reg_tbl <- broom::tidy(capm_tsmom) %>%
+  dplyr::mutate(term = dplyr::recode(term, `(Intercept)` = "Alpha", `MXEF_Return` = "Beta (MXEF)")) %>%
+  dplyr::select(term, estimate, std.error, statistic, p.value)
+knitr::kable(dplyr::mutate(reg_tbl, dplyr::across(where(is.numeric), ~ round(., 4))),
+             caption = "CAPM Regression: TSMOM ~ MXEF (Monthly)")
+
+
+```
